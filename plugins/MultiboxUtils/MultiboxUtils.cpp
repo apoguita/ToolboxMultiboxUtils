@@ -15,6 +15,7 @@
 #include <GWCA/Managers/ItemMgr.h>
 #include <GWCA/GameEntities/Skill.h>
 #include <GWCA/Managers/SkillbarMgr.h>
+//#include <Modules/InventoryManager.h>
 
 
 
@@ -33,6 +34,7 @@ struct StateMachine {
     bool IsLootingEnabled;
     bool IsCombatEnabled;
     bool IsTargettingEnabled;
+    bool IsScatterEnabled;
 };
 
 StateMachine Machine;
@@ -51,6 +53,7 @@ enum combatState { cIdle, InCastingRoutine, InRecharge };
 struct CombatStateMachine {
     combatState State;
     clock_t LastActivity;
+    clock_t StayAlert;
     uint32_t castingptr;
     uint32_t currentCastingSlot;
     bool IsSkillCasting = false;
@@ -58,6 +61,13 @@ struct CombatStateMachine {
 };
 
 CombatStateMachine CombatMachine;
+
+static GW::AgentID oldCalledTarget;
+static GW::AgentID newCalledTarget;
+
+float ScatterPos[8] = {0.0f, 45.0f, 0.0f, -45.0f, 90.0f, -90.0f, 135.0f, -135.0f };
+
+
 
 
 void wcs_tolower(wchar_t* s)
@@ -235,7 +245,7 @@ void MultiboxUtils::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const
             GW::GameThread::Enqueue([] {
             Machine.IsTargettingEnabled = !Machine.IsTargettingEnabled;
 
-            if (Machine.IsFollowingEnabled) {
+            if (Machine.IsTargettingEnabled) {
                 WriteChat(GW::Chat::CHANNEL_GWCA1, L"TargettingAI Enabled", L"MultiboxUtils");
             }
             else {
@@ -245,6 +255,20 @@ void MultiboxUtils::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const
         });
     WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autotarget To drop hovered item to the ground", L"MultiboxUtils");
 
+    GW::Chat::CreateCommand(L"scatter", [](const wchar_t*, int, const LPWSTR*) {
+        GW::GameThread::Enqueue([] {
+            Machine.IsScatterEnabled = !Machine.IsScatterEnabled;
+
+            if (Machine.IsScatterEnabled) {
+                WriteChat(GW::Chat::CHANNEL_GWCA1, L"ScatterAI Enabled", L"MultiboxUtils");
+            }
+            else {
+                WriteChat(GW::Chat::CHANNEL_GWCA1, L"ScatterAI Disabled", L"MultiboxUtils");
+            }
+            });
+        });
+    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /scatter toggle Scatter AI", L"MultiboxUtils");
+
     GW::Chat::CreateCommand(L"heroai", [](const wchar_t*, int, const LPWSTR*) {
         GW::GameThread::Enqueue([] {
             
@@ -252,6 +276,12 @@ void MultiboxUtils::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const
             Machine.IsLootingEnabled = !Machine.IsLootingEnabled;
             Machine.IsCombatEnabled = !Machine.IsCombatEnabled;
             Machine.IsTargettingEnabled = !Machine.IsTargettingEnabled;
+            Machine.IsScatterEnabled = !Machine.IsScatterEnabled;
+
+
+            for (int i = 0; i < 8; i++) {
+                CombatSkillState[i] = !CombatSkillState[i];
+            }
 
             if (Machine.IsFollowingEnabled) {
                 WriteChat(GW::Chat::CHANNEL_GWCA1, L"HeroAI Enabled", L"MultiboxUtils");
@@ -261,7 +291,7 @@ void MultiboxUtils::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const
             }
             });
         });
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /heroai To drop hovered item to the ground", L"MultiboxUtils");
+    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /heroai to toggle all features at once", L"MultiboxUtils");
 
     GW::Chat::CreateCommand(L"autocombat", &CmdCombat);
 
@@ -277,6 +307,11 @@ bool MultiboxUtils::IsMapExplorable() {
     else { return false; }
 };
 
+float DegToRad(float degree) {
+    // converting degrees to radians
+    return ( degree * 3.14159 / 180);
+}
+
 void MultiboxUtils::Update(float)
 {
     if (!IsMapExplorable()) { return; }
@@ -291,48 +326,80 @@ void MultiboxUtils::Update(float)
     const auto tLeaderliving = tLeader->GetAsAgentLiving();
     if (!tLeaderliving) { return; }
 
+    /* target monitor*/
+    const auto targetChange = PartyTargetIDChanged(); 
+    if ((Machine.IsTargettingEnabled) &&
+        (targetChange != 0)) {
+        GW::Agents::ChangeTarget(targetChange);
+    }
+    /* */
+
+    if ((Machine.IsScatterEnabled) && (GetPartyNumber() >1)){
+        const auto xx = tLeaderliving->x;
+        const auto yy = tLeaderliving->y;
+        const auto heropos = (GetPartyNumber() - 1) + GW::PartyMgr::GetPartyHeroCount() + GW::PartyMgr::GetPartyHenchmanCount();
+        const auto angle = tLeaderliving->rotation_angle + DegToRad(ScatterPos[heropos]);
+        const auto rotcos = cos(angle); 
+        const auto rotsin = sin(angle);
+
+
+        const auto posx = GW::Constants::Range::Adjacent * rotcos;
+        const auto posy = GW::Constants::Range::Adjacent * rotsin;
+
+        GW::Agents::Move(xx + posx, yy + posy);
+        //GW::Agents::Move(xx + GW::Constants::Range::Adjacent,yy);
+        Machine.IsScatterEnabled = false;
+    }
+
+    if ((tLeaderliving->GetIsAttacking()) ||
+        (tLeaderliving->GetIsCasting())) {
+
+        CombatMachine.StayAlert = clock();
+    }
+
     if (Machine.State != Looting) {
         if ((tSelf->GetIsMoving()) || (tSelf->GetIsCasting())  || (tSelf->GetIsAttacking())) {
             Machine.State = Idle;
             Machine.LastActivity = clock();
         }
     }
+
     const auto dist = GW::GetDistance(tSelf->pos, tLeaderliving->pos);
 
     /******************COMBAT ROUTINES *********************************/
-    
-    if ((Machine.IsCombatEnabled) && (TargetNearestEnemyInAggro() != 0)) {
-        //WriteChat(GW::Chat::CHANNEL_GWCA1, L"very first step", L"MultiboxUtils");
+
+    if ((Machine.IsCombatEnabled) && (TargetNearestEnemyInAggro() != 0) && (!tSelf->GetIsMoving())) {
+
+        if (((dist > GW::Constants::Range::Area) && (CombatMachine.State == cIdle))/* || (tSelf->GetIsMoving())*/) {
+            Machine.State = Following;
+            goto forcedwalk; //dirty trick to force following mid combat
+        }
+
 
         switch (CombatMachine.State) {
         case cIdle:
-            
+
             if (!CombatSkillState[CombatMachine.castingptr]) { CombatMachine.castingptr++; break; }
             if (!IsAllowedCast()) {
-                WriteChat(GW::Chat::CHANNEL_GWCA1, L"is not allowed to cast", L"MultiboxUtils");
                 break;
             }
 
             if (IsSkillready(CombatMachine.castingptr)) {
-                WriteChat(GW::Chat::CHANNEL_GWCA1, L"in casting ptr", L"MultiboxUtils");
 
                 CombatMachine.State = InCastingRoutine;
                 CombatMachine.currentCastingSlot = CombatMachine.castingptr;
                 SmartSelectTarget();
                 CastSkill(CombatMachine.currentCastingSlot);
-                WriteChat(GW::Chat::CHANNEL_GWCA1, L"cast executed", L"MultiboxUtils");
 
             }
-            else { 
-                WriteChat(GW::Chat::CHANNEL_GWCA1, L"skill is not ready", L"MultiboxUtils");
-                CombatMachine.castingptr++; 
-                break; 
+            else {
+                CombatMachine.castingptr++;
+                break;
             }
             break;
         case InCastingRoutine:
-            WriteChat(GW::Chat::CHANNEL_GWCA1, L"waiting to finish cast", L"MultiboxUtils");
+
             if (!IsAllowedCast()) { break; }
-            WriteChat(GW::Chat::CHANNEL_GWCA1, L"cast finished", L"MultiboxUtils");
             CombatMachine.State = cIdle;
 
             CombatMachine.castingptr++;
@@ -340,27 +407,34 @@ void MultiboxUtils::Update(float)
 
         default:
             CombatMachine.State = cIdle;
-            WriteChat(GW::Chat::CHANNEL_GWCA1, L"default status", L"MultiboxUtils");
         }
         if (CombatMachine.castingptr >= 8) { CombatMachine.castingptr = 0; }
     }
-
+    else {
+        CombatMachine.castingptr = 0;
+    }
+    forcedwalk:
     /**************************************************/
 
-    switch (Machine.State) {
+    
+
+      switch (Machine.State) {
     case Idle:
 
         if ((Machine.IsFollowingEnabled) &&
             (dist > GW::Constants::Range::Area) &&
             (!tSelf->GetIsMoving()) &&
-            (!tSelf->GetIsCasting()) //&&
-            //(!tSelf->GetIsAttacking())
+            (!tSelf->GetIsCasting()) 
             ) {
             Machine.State = Following;
             break;
         }
- 
-        if ((Machine.IsLootingEnabled) && ((clock() - Machine.LastActivity) > 2000)) {
+
+        if ((Machine.IsLootingEnabled) && 
+            ((clock() - Machine.LastActivity) > 750) && 
+            (!TargetNearestEnemyInAggro()) &&
+            (ThereIsSpaceInInventory())
+            ) {
             Machine.State = Looting;
             break;
         }
@@ -369,7 +443,9 @@ void MultiboxUtils::Update(float)
         uint32_t tItem;
 
         while ((tItem = TargetNearestItem()) != 0) {
-            GW::Agents::PickUpItem(GW::Agents::GetAgentByID(tItem), false);
+            if (ThereIsSpaceInInventory()) {
+                GW::Agents::PickUpItem(GW::Agents::GetAgentByID(tItem), false);
+            }
             return; //this return is in place instead of a real wait while looting routine
         }
         Machine.LastActivity = clock();
@@ -379,22 +455,108 @@ void MultiboxUtils::Update(float)
     case Following: 
         GW::Agents::InteractAgent(tLeader, false); 
         break;
-    case Combat:
-        //CombatLoop();
-        break;
-    default:
-        break;
     }
                   
 }
 
+int MultiboxUtils::GetPartyNumber() {
+    const GW::PartyInfo* Party = GW::PartyMgr::GetPartyInfo(); 
+    if (!Party) { return 0; } 
+
+    const auto tSelf = GW::Agents::GetPlayerAsAgentLiving();
+    const auto tSelfId = tSelf->agent_id;
+
+    for (int i = 0; i < GW::PartyMgr::GetPartySize(); i++)
+    {
+        const auto playerId = GW::Agents::GetAgentIdByLoginNumber(Party->players[i].login_number);
+        if (playerId == tSelfId) {
+            return i+1;
+        }
+    }
+    return 0;
+}
+
+GW::AgentID MultiboxUtils::PartyTargetIDChanged() {
+ 
+    const GW::PartyInfo* Party = GW::PartyMgr::GetPartyInfo(); 
+    if (!Party) { return 0; }
+    
+    if (!Party->players[0].connected()) { return 0; }
+    const auto tLeaderid = GW::Agents::GetAgentIdByLoginNumber(Party->players[0].login_number); 
+    if (!tLeaderid) { return 0; } 
+    const auto tLeader = GW::Agents::GetAgentByID(tLeaderid);
+    if (!tLeader) { return 0; }
+
+    const auto target = Party->players[0].calledTargetId; 
+ 
+    if (!target) {
+        oldCalledTarget = 0;
+        return 0;
+    }
+
+    if (oldCalledTarget != target) {
+        oldCalledTarget = target;
+        return oldCalledTarget;
+    }
+ 
+    return 0;
+
+}
+
 uint32_t  MultiboxUtils::TargetNearestEnemyInAggro() {
+    const auto agents = GW::Agents::GetAgentArray();
+    const auto tSelf = GW::Agents::GetPlayerAsAgentLiving();
+
+    if (!tSelf) { return 0; }
+
+    float distance = GW::Constants::Range::Earshot;
+    float maxdistance = GW::Constants::Range::Earshot;
+    if ((clock() - CombatMachine.StayAlert) <= 2500) {
+
+        distance = GW::Constants::Range::Spellcast;
+        maxdistance = GW::Constants::Range::Spellcast;
+    }
+
+    static GW::AgentID EnemyID;
+    static GW::AgentID tStoredEnemyID = 0;
+
+    for (const GW::Agent* agent : *agents)
+    {
+        if (!IsMapExplorable()) { return 0; }
+        if (!agent) { continue; }
+        if (!agent->GetIsLivingType()) { continue; }
+        const auto tEnemyLiving = agent->GetAsAgentLiving();
+        if (!tEnemyLiving) { continue; }
+        if (tEnemyLiving->allegiance != GW::Constants::Allegiance::Enemy) { continue; }
+
+        EnemyID = tEnemyLiving->agent_id;
+
+        if (!EnemyID) { continue; }
+
+        const auto tempAgent = GW::Agents::GetAgentByID(EnemyID);
+
+        if (!tempAgent) { continue; }
+        if (!tempAgent->GetAsAgentLiving()->GetIsAlive()) { continue; }
+        const auto dist = GW::GetDistance(tSelf->pos, tempAgent->pos);
+
+        if (dist < distance) {
+            distance = dist;
+            tStoredEnemyID = EnemyID;
+        }
+    }
+    if (distance != maxdistance){ return tStoredEnemyID; }
+    else {
+        return 0;
+    }
+}
+
+uint32_t  MultiboxUtils::TargetNearestEnemyInBigAggro() {
     const auto agents = GW::Agents::GetAgentArray(); 
     const auto tSelf = GW::Agents::GetPlayerAsAgentLiving(); 
 
     if (!tSelf) { return 0; } 
 
-    float distance = GW::Constants::Range::Earshot;  
+    float distance = GW::Constants::Range::Spellcast;
     static GW::AgentID EnemyID; 
     static GW::AgentID tStoredEnemyID = 0; 
 
@@ -422,7 +584,7 @@ uint32_t  MultiboxUtils::TargetNearestEnemyInAggro() {
             tStoredEnemyID = EnemyID;
         }
     }
-    if (distance != GW::Constants::Range::Earshot){ return tStoredEnemyID; }
+    if (distance != GW::Constants::Range::Spellcast) { return tStoredEnemyID; }
     else {
         return 0;
     }
@@ -435,7 +597,8 @@ uint32_t MultiboxUtils::TargetNearestItem()
 
     if (!tSelf) { return 0; }
 
-    float distance = GW::Constants::Range::Compass;
+    float distance = GW::Constants::Range::Spellcast;
+    
     static GW::AgentID ItemID;
     static GW::AgentID tStoredItemID = 0;
 
@@ -467,7 +630,7 @@ uint32_t MultiboxUtils::TargetNearestItem()
             tStoredItemID = ItemID;
         }
     }
-    if (distance != GW::Constants::Range::Compass) { return tStoredItemID; }
+    if (distance != GW::Constants::Range::Spellcast) { return tStoredItemID; }
     else {
         return 0;
     }  
@@ -490,8 +653,6 @@ bool MultiboxUtils::IsSkillready(uint32_t slot) {
 }
 
 void MultiboxUtils::CastSkill(uint32_t slot) {
-
-    
     
     const auto tSelf = GW::Agents::GetPlayerAsAgentLiving();  
     if (!tSelf) { return; } 
@@ -510,17 +671,25 @@ void MultiboxUtils::CastSkill(uint32_t slot) {
     
     if (skill.GetRecharge() != 0 ) {return;}
 
-    if (tSelf->energy >= skilldata.energy_cost) { return; }    
+    const auto current_energy = static_cast<uint32_t>((tSelf->energy * tSelf->max_energy));
+    if (current_energy < skilldata.energy_cost) { return; }
+
+    const auto enough_adrenaline =
+        (skilldata.adrenaline == 0) || (skilldata.adrenaline > 0 && skill.adrenaline_a >= skilldata.adrenaline);
     
-    if ((skilldata.adrenaline > 0) && (skill.adrenaline_a < skilldata.adrenaline)) { return; }
+    if (!enough_adrenaline) { return; }
 
     if ((!tSelf->GetIsCasting()) && (skill.GetRecharge() == 0) && (!CombatMachine.IsSkillCasting)){
         CombatMachine.IsSkillCasting = true;
         CombatMachine.LastActivity = clock();
         CombatMachine.IntervalSkillCasting = skilldata.activation + 750;
-        GW::SkillbarMgr::UseSkill(slot, GW::Agents::GetTargetId());      
+        GW::SkillbarMgr::UseSkill(slot, GW::Agents::GetTargetId()); 
+        const auto target = GW::Agents::GetTargetId(); 
+        if (target) { 
+            GW::Agents::InteractAgent(GW::Agents::GetAgentByID(target), false); 
+        }
     }
-   
+  
 }
 
 bool MultiboxUtils::IsAllowedCast() {
@@ -543,32 +712,39 @@ void MultiboxUtils::SmartSelectTarget() {
     const auto tLeader = GW::Agents::GetAgentByID(tLeaderid); 
     if (!tLeader) { return; }  
 
-    
-    
+      
     if (Machine.IsTargettingEnabled) {
-        //const auto* target = GW::Agents::GetTarget(); 
-        const auto target = Party->players[0].calledTargetId; 
+        const auto target = GW::Agents::GetTargetId();
         if (!target) { 
-            GW::Agents::ChangeTarget(GW::Agents::GetAgentByID(TargetNearestEnemyInAggro())); 
-            //GW::Agents::InteractAgent(GW::Agents::GetAgentByID(TargetNearestEnemyInAggro()), false);  
+            GW::Agents::ChangeTarget(GW::Agents::GetAgentByID(TargetNearestEnemyInBigAggro())); 
+            GW::Agents::InteractAgent(GW::Agents::GetAgentByID(TargetNearestEnemyInBigAggro()), false);  
         }
-        else
-        {
-            GW::Agents::ChangeTarget(target); 
-            //GW::Agents::InteractAgent( false);
-        }
-
     }
 
-    //GW::Agents::ChangeTarget(GW::Agents::GetAgentByID(TargetNearestEnemyInAggro())); 
+}
 
-    const auto finalTarget = GW::Agents::GetTargetId();
+bool MultiboxUtils::ThereIsSpaceInInventory()
+{
 
-    if (!finalTarget) { return; }
+    GW::Bag** bags = GW::Items::GetBagArray();
+    if (!bags) {
+        return false;
+    }
+    size_t end_bag = static_cast<size_t>(GW::Constants::Bag::Bag_2);
 
-    GW::Agents::ChangeTarget(GW::Agents::GetAgentByID(finalTarget));
-    GW::Agents::InteractAgent(GW::Agents::GetAgentByID(finalTarget), false);
 
+    for (size_t bag_idx = static_cast<size_t>(GW::Constants::Bag::Backpack); bag_idx <= end_bag; bag_idx++) {
+        GW::Bag* bag = bags[bag_idx];
+        if (!bag || !bag->items.valid()) {
+            continue;
+        }
+        for (size_t slot = 0; slot < bag->items.size(); slot++) {
+            if (!bag->items[slot]) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void MultiboxUtils::SignalTerminate() 
@@ -594,4 +770,71 @@ void MultiboxUtils::Terminate()
     GW::Terminate();
 }
 
+
+
+void MultiboxUtils::Draw(IDirect3DDevice9*)
+{
+    auto DialogButton = [](const int x_idx, const int x_qty, const char* text, const char* help, const DWORD dialog) -> void {
+        if (x_idx != 0) {
+            ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+        }
+        const float w = (ImGui::GetWindowWidth() - ImGui::GetStyle().ItemInnerSpacing.x * (x_qty - 1)) / x_qty;
+        if (text != nullptr && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(help);
+        }
+        };
+
+    const auto& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin(Name(), can_close && show_closebutton ? GetVisiblePtr() : nullptr, GetWinFlags(ImGuiWindowFlags_NoScrollbar))) {
+        
+        ImGui::BeginTable("maintable", 2);
+        ImGui::TableNextRow(); 
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Checkbox("Auto-Loot", &Machine.IsLootingEnabled);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Checkbox("Auto-Follow", &Machine.IsFollowingEnabled);
+        ImGui::TableNextRow(); 
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Checkbox("Auto-Target", &Machine.IsTargettingEnabled);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Checkbox("Auto-Combat", &Machine.IsCombatEnabled);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Checkbox("Scatter", &Machine.IsScatterEnabled);
+        ImGui::EndTable(); 
+
+        ImGui::Text("Allowed Skills");
+        
+        ImGui::BeginTable("table1", 8);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Checkbox("1", &CombatSkillState[0]);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Checkbox("2", &CombatSkillState[1]);
+        ImGui::TableSetColumnIndex(2);
+        ImGui::Checkbox("3", &CombatSkillState[2]);
+        ImGui::TableSetColumnIndex(3);
+        ImGui::Checkbox("4", &CombatSkillState[3]);
+        ImGui::TableSetColumnIndex(4);
+        ImGui::Checkbox("5", &CombatSkillState[4]);
+        ImGui::TableSetColumnIndex(5);
+        ImGui::Checkbox("6", &CombatSkillState[5]);
+        ImGui::TableSetColumnIndex(6);
+        ImGui::Checkbox("7", &CombatSkillState[6]);
+        ImGui::TableSetColumnIndex(7);
+        ImGui::Checkbox("8", &CombatSkillState[7]);
+
+        ImGui::EndTable();
+
+    }
+    ImGui::End();
+}
+
+void MultiboxUtils::DrawSettings()
+{
+    ToolboxUIPlugin::DrawSettings();
+
+}
 
