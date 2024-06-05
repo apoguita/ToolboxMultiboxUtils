@@ -26,6 +26,8 @@ public:
     bool IsAllowedCast();
     bool ThereIsSpaceInInventory();
     GW::AgentID PartyTargetIDChanged();
+    float AngleChange();
+
 
     void SmartSelectTarget();
     uint32_t TargetNearestEnemyInAggro();
