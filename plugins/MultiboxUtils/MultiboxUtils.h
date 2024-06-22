@@ -10,6 +10,7 @@
 
 
 
+
 class HeroAI : public ToolboxUIPlugin {
 public:
     HeroAI()
@@ -23,10 +24,14 @@ public:
     const char* Name() const override { return "HeroAI"; }
     const char* Icon() const override { return ICON_FA_LOCK_OPEN; }
 
+    bool WndProc(const UINT Message, const WPARAM wParam, const LPARAM lParam);
+    bool OnMouseMove(const UINT, const WPARAM, const LPARAM lParam);
+
     /**************SKILL BEAHVIOUR DECLARATION ***********************************/
 
     enum SkillNature { Offensive, OffensiveCaster, OffensiveMartial, Enchantment_Removal, Healing, Hex_Removal, Condi_Cleanse, Buff,EnergyBuff, Neutral, SelfTargetted, Resurrection, Interrupt }; 
     enum SkillTarget { Enemy, EnemyCaster, EnemyMartial, Ally, AllyCaster, AllyMartial, OtherAlly,DeadAlly, Self, Corpse, Minion, Spirit, Pet }; 
+    enum WeaponType { bow = 1, axe, hammer, daggers, scythe, spear, sword, wand = 10, staff1 = 12, staff2 = 14 }; // 1=bow, 2=axe, 3=hammer, 4=daggers, 5=scythe, 6=spear, 7=sWORD, 10=wand, 12=staff, 14=staff};
 
     struct castConditions {
         bool IsAlive = true;
@@ -89,8 +94,8 @@ public:
 
 
     void ChooseTarget();
-    uint32_t TargetNearestEnemyInAggro(bool IsBigAggro = false);
-    uint32_t TargetLowestAllyInAggro();
+    uint32_t TargetNearestEnemyInAggro(bool IsBigAggro = false, SkillTarget Target = Enemy);
+    uint32_t TargetLowestAllyInAggro(bool OtherAlly = false, bool CheckEnergy = false, SkillTarget Target = Ally);
     uint32_t TargetDeadAllyInAggro();
     uint32_t TargetNearestItem();
     int GetPartyNumber();
@@ -108,47 +113,53 @@ public:
 
 private:
     struct MapStruct {
-        bool IsExplorable;
-        bool IsLoading;
-        bool IsOutpost;
-        bool IsPartyLoaded;
+        bool IsExplorable=false;
+        bool IsLoading=false;
+        bool IsOutpost = false;
+        bool IsPartyLoaded = false;
     };
     struct AgentTargetStruct {
-        GW::Agent* Agent;
-        GW::AgentID ID;
-        GW::AgentLiving* Living;
+        GW::Agent* Agent =0;
+        GW::AgentID ID =0;
+        GW::AgentLiving* Living =0;
     };
 
     struct TargetStruct {
         AgentTargetStruct Self;
         AgentTargetStruct Called;
         AgentTargetStruct Nearest;
-        AgentTargetStruct NearestAlly;
+        AgentTargetStruct NearestMartial;
+        AgentTargetStruct NearestCaster;
+        AgentTargetStruct LowestAlly;
+        AgentTargetStruct LowestAllyMartial;
+        AgentTargetStruct LowestAllyCaster;
         AgentTargetStruct DeadAlly;
+        AgentTargetStruct LowestOtherAlly;
+        AgentTargetStruct LowestEnergyOtherAlly;
     };
     struct PartyStruct {
-        GW::PartyInfo* PartyInfo;
-        uint32_t LeaderID;
-        GW::Agent* Leader;
-        GW::AgentLiving* LeaderLiving;
-        int SelfPartyNumber;
-        bool IsLeaderAttacking;
-        bool IsLeaderCasting;
+        GW::PartyInfo* PartyInfo = 0;
+        uint32_t LeaderID = 0;
+        GW::Agent* Leader = 0;
+        GW::AgentLiving* LeaderLiving = 0;
+        int SelfPartyNumber = -1;
+        bool IsLeaderAttacking = false;
+        bool IsLeaderCasting = false;
 
     };
     struct CombatFieldStruct {
-        bool InAggro;
-        float DistanceFromLeader;
-        bool IsSelfMoving;
-        bool IsSelfCasting;
-        bool IsSelfKnockedDwon;
+        bool InAggro = false;
+        float DistanceFromLeader = 0.0f;
+        bool IsSelfMoving = false;
+        bool IsSelfCasting = false;
+        bool IsSelfKnockedDwon = false;
 
     };
     struct SkillStruct {
         GW::SkillbarSkill Skill;
         GW::Skill Data;
         CustomSkillData CustomData;
-        bool HasCustomData;
+        bool HasCustomData = false;
     };
     struct SkillBarStruct {
         GW::Skillbar* SkillBar;
@@ -164,12 +175,30 @@ private:
         SkillBarStruct SkillBar;
         bool IsMemoryLoaded = false;
         float LastTimeSubscribed = 0.0f;
-        bool RecentlySubscribed() { return ((clock() - LastTimeSubscribed) < 100000) ? true : false;}
+        bool RecentlySubscribed() { return ((clock() - LastTimeSubscribed) < 1000) ? true : false;}
     };
 
     
     GameVarsStruct GameVars;
-    GameVarsStruct MemPlayers[8];
+
+    struct MemSinglePlayer {
+        GW::AgentID ID = 0;
+        float Energy = 0.0f;
+        float energyRegen = 0.0f;
+        bool IsActive = false;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+
+    struct MemPlayerStruct {
+        MemSinglePlayer MemPlayers[8]; 
+    };
+
+    MemPlayerStruct MemCopy;
+    
+    MemPlayerStruct* MemData;
+    
+    //GameVarsStruct MemPlayers[8];
 
     struct ClockStruct {
         float LastTimeAccesed = 0.0f;
@@ -177,15 +206,19 @@ private:
     };
     ClockStruct FileAccessClock;
 
-    // MEMORY VER 2
-    void setFileSize(HANDLE hFile, DWORD size);
-    HANDLE createMemoryMappedFile(HANDLE& hFileMapping);
-    bool writeGameVarsToFile(HANDLE hFileMapping, int clientIndex, GameVarsStruct* gameVars);
-    bool readGameVarsFromFile(HANDLE hFileMapping, int clientIndex, GameVarsStruct* gameVars);
-
-    // MEMORY MAPPED FILE
+    //Memory ver 3
+    HANDLE hMapFile;
+    void InitializeSharedMemory(MemPlayerStruct*& pData);
+    //End Memory Ver 3
 
     bool UpdateGameVars();
+
+    //--------- mouse click coords implementation
+    uintptr_t GetBasePointer();
+    float* GetClickCoordsX();
+    float* GetClickCoordsY();
+    void SendCoords();
+    static void CallSendCoords();
 
     struct PlayerMapping
     {

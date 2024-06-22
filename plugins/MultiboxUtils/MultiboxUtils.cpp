@@ -1,6 +1,17 @@
 #include "MultiboxUtils.h"
 
 #include <GWCA/GWCA.h>
+#include <GWCA/Utilities/Macros.h>
+#include <GWCA/Utilities/Scanner.h>
+
+//-------------------------
+
+#include <GWCA/Managers/CameraMgr.h> // Include camera manager for screen to world coordinates conversion
+#include <GWCA/Managers/UIMgr.h> // Include UI manager for click event handling
+
+
+//-----------------------------
+
 
 #pragma comment(lib, "Shlwapi.lib")
 #include <GWCA/Utilities/Hooker.h>
@@ -26,123 +37,87 @@
 #include <cstring>
 
 #define CLIENT_COUNT 8
-#define GAMEVARS_SIZE sizeof(GameVarsStruct)
+#define GAMEVARS_SIZE sizeof(MemPlayerStruct) 
+
+uintptr_t Base_address = 0;
+
+
+#define SHM_NAME "GWHeroAISharedMemory"
 HANDLE hFileMapping; 
-//#define FILE_NAME "shared_gamevars.dat"
+
 std::wstring FILE_NAME;
 
-void HeroAI::setFileSize(HANDLE hFile, DWORD size) {
-    LARGE_INTEGER li;
-    li.QuadPart = size;
-    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) {
-        std::cerr << "SetFilePointerEx failed (" << GetLastError() << ")." << std::endl;
-    }
-    if (!SetEndOfFile(hFile)) {
-        std::cerr << "SetEndOfFile failed (" << GetLastError() << ")." << std::endl;
-    }
-}
-
-
-HANDLE HeroAI::createMemoryMappedFile(HANDLE& hFileMapping) {
-    HANDLE hFile = CreateFileW (/*CreateFile(*/
-        FILE_NAME.c_str(),              // Name of the file
-        GENERIC_READ | GENERIC_WRITE, // Desired access
-        FILE_SHARE_READ | FILE_SHARE_WRITE,//sharing read and write
-        NULL,                   // Default security
-        OPEN_ALWAYS,            // Open existing or create new
-        FILE_ATTRIBUTE_NORMAL,  // Normal file
-        NULL                    // No template file
+void HeroAI::InitializeSharedMemory(MemPlayerStruct*& pData) {
+    //HANDLE hMapFile = OpenFileMapping(
+    hMapFile = OpenFileMapping(
+        FILE_MAP_ALL_ACCESS,    // read/write access
+        FALSE,                  // do not inherit the name
+        SHM_NAME                // name of mapping object
     );
 
-    if (hFile == INVALID_HANDLE_VALUE) {
-        std::cerr << "Could not create or open file (" << GetLastError() << ")." << std::endl;
-        return NULL;
+    if (hMapFile == NULL) {
+        // If opening failed, create the file mapping object
+        hMapFile = CreateFileMapping(
+            INVALID_HANDLE_VALUE,   // use paging file
+            NULL,                   // default security
+            PAGE_READWRITE,         // read/write access
+            0,                      // maximum object size (high-order DWORD)
+            GAMEVARS_SIZE,          // maximum object size (low-order DWORD)
+            SHM_NAME                // name of mapping object
+        );
+
+        if (hMapFile == NULL) {
+            //std::cerr << "Could not create or open file mapping object (" << GetLastError() << ")." << std::endl;
+            WriteChat(GW::Chat::CHANNEL_GWCA1, L"Could not create or open file mapping object", L"Hero AI"); 
+            return;
+        }
+
+        // Map the file mapping object into the process's address space
+        pData = (MemPlayerStruct*)MapViewOfFile(
+            hMapFile,               // handle to map object
+            FILE_MAP_ALL_ACCESS,    // read/write permission
+            0,                      // offset high
+            0,                      // offset low
+            GAMEVARS_SIZE
+        );
+
+        if (pData == NULL) {
+            //std::cerr << "Could not map view of file (" << GetLastError() << ")." << std::endl;
+            WriteChat(GW::Chat::CHANNEL_GWCA1, L"Could not map view of file", L"Hero AI");
+            CloseHandle(hMapFile);
+            return;
+        }
+
+        // Initialize shared memory data if this is the first creation
+        // pData->some_variable = 0;
+        for (int i = 0; i < 8; i++) {
+            pData->MemPlayers[i].ID = 0;
+            pData->MemPlayers[i].energyRegen = 0.0f;
+            pData->MemPlayers[i].Energy = 0.0f;
+            pData->MemPlayers[i].IsActive = false;
+        }
+        // Initialize other variables as needed
+
     }
+    else {
+        // Map the existing file mapping object into the process's address space
+        pData = (MemPlayerStruct*)MapViewOfFile( 
+            hMapFile,               // handle to map object
+            FILE_MAP_ALL_ACCESS,    // read/write permission
+            0,                      // offset high
+            0,                      // offset low
+            GAMEVARS_SIZE
+        );
 
-    setFileSize(hFile, CLIENT_COUNT * GAMEVARS_SIZE); 
+        if (pData == NULL) {
+            //std::cerr << "Could not map view of file (" << GetLastError() << ")." << std::endl;
+            WriteChat(GW::Chat::CHANNEL_GWCA1, L"Could not map view of file2", L"Hero AI");
+            CloseHandle(hMapFile);
+            return;
 
-    hFileMapping = CreateFileMapping(
-        hFile,                  // Handle to the file
-        NULL,                   // Default security
-        PAGE_READWRITE,         // Read/write access
-        0,                      // Maximum object size (high-order DWORD)
-        CLIENT_COUNT * GAMEVARS_SIZE,  // Maximum object size (low-order DWORD)
-        NULL                    // Name of mapping object
-    );
-
-    if (hFileMapping == NULL) {
-        std::cerr << "Could not create file mapping object (" << GetLastError() << ")." << std::endl;
-        CloseHandle(hFile);
-        return NULL;
+        }
     }
-
-    CloseHandle(hFile);  // The file handle is no longer needed after creating the mapping
-    return hFileMapping;
 }
-
-bool HeroAI::writeGameVarsToFile(HANDLE hFileMapping, int clientIndex, GameVarsStruct* gameVars) {
-    if (clientIndex < 0 || clientIndex >= CLIENT_COUNT) {
-        std::cerr << "Invalid client index." << std::endl;
-        return false;
-    }
-
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-
-    // Ensure the offset is aligned to the allocation granularity
-    DWORD offset = clientIndex * GAMEVARS_SIZE; 
-    DWORD alignedOffset = (offset / si.dwAllocationGranularity) * si.dwAllocationGranularity; 
-
-
-    LPVOID pBuf = MapViewOfFile(
-        hFileMapping,           // Handle to map object
-        FILE_MAP_ALL_ACCESS,         // Read/write permission
-        0,
-        alignedOffset, 
-        GAMEVARS_SIZE
-    );
-
-    if (pBuf == NULL) {
-        std::cerr << "Could not map view of file (" << GetLastError() << ")." << std::endl;
-        return false;
-    }
-
-    std::memcpy(pBuf, gameVars, GAMEVARS_SIZE);
-    UnmapViewOfFile(pBuf);
-    return true;
-}
-
-bool HeroAI::readGameVarsFromFile(HANDLE hFileMapping, int clientIndex, GameVarsStruct* gameVars) {
-    if (clientIndex < 0 || clientIndex >= CLIENT_COUNT) {
-        std::cerr << "Invalid client index." << std::endl;
-        return false;
-    }
-
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-
-    // Ensure the offset is aligned to the allocation granularity
-    DWORD offset = clientIndex * GAMEVARS_SIZE;
-    DWORD alignedOffset = (offset / si.dwAllocationGranularity) * si.dwAllocationGranularity;
-
-    LPVOID pBuf = MapViewOfFile(
-        hFileMapping,           // Handle to map object
-        FILE_MAP_READ,          // Read permission
-        0,
-        alignedOffset,
-        GAMEVARS_SIZE
-    );
-
-    if (pBuf == NULL) {
-        std::cerr << "Could not map view of file (" << GetLastError() << ")." << std::endl;
-        return false;
-    }
-
-    std::memcpy(gameVars, pBuf, GAMEVARS_SIZE);
-    UnmapViewOfFile(pBuf);
-    return true;
-}
-
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -238,7 +213,44 @@ void HeroAI::deserializeSpecialSkills(const std::string& filename) {
     }
 }
 
+//MOUSE STUFF
+bool HeroAI::WndProc(const UINT Message, const WPARAM wParam, const LPARAM lParam)
+{
 
+    switch (Message) {
+    case WM_MOUSEMOVE:
+        return OnMouseMove(Message, wParam, lParam);
+    /*case WM_LBUTTONDOWN:
+        return OnMouseDown(Message, wParam, lParam);
+    case WM_MOUSEWHEEL:
+        return OnMouseWheel(Message, wParam, lParam);
+    case WM_LBUTTONDBLCLK:
+        return OnMouseDblClick(Message, wParam, lParam);
+    case WM_LBUTTONUP:
+        return OnMouseUp(Message, wParam, lParam);*/
+    default:
+        return false;
+    }
+}
+
+bool HeroAI::OnMouseMove(const UINT, const WPARAM, const LPARAM lParam)
+{
+    const int x = GET_X_LPARAM(lParam);
+    const int y = GET_Y_LPARAM(lParam);
+
+    std::wstring xCoordString = std::to_wstring(x);
+    std::wstring yCoordString = std::to_wstring(y);
+
+    std::wstring coords = xCoordString + L"," + yCoordString;
+    WriteChat(GW::Chat::CHANNEL_GWCA1, coords.c_str(), L"Gwtoolbot");
+
+    // Indicate that the message was handled, but we want to ensure default processing continues
+    return false;
+}
+
+
+
+//END MOUSE STUFF
 
 
 
@@ -410,15 +422,59 @@ static void CmdCombat(const wchar_t*, const int argc, const LPWSTR* argv) {
         
     }
 }
+// Click Coords implementation
+uintptr_t HeroAI::GetBasePointer()
+{
+    return Base_address;
+}
+float* HeroAI::GetClickCoordsX()
+{
+    uintptr_t basePointer = GetBasePointer();
+    if (basePointer == 0) return nullptr;
 
+    return reinterpret_cast<float*>(basePointer + 0x4ECC);
+}
+
+float* HeroAI::GetClickCoordsY()
+{
+    uintptr_t basePointer = GetBasePointer();
+    if (basePointer == 0) return nullptr;
+    return reinterpret_cast<float*>(basePointer + 0x4ED0);
+}
+
+void HeroAI::SendCoords()
+{
+    float* clickCoordsX = GetClickCoordsX();
+    float* clickCoordsY = GetClickCoordsY();
+
+    if (clickCoordsX && clickCoordsY) {
+        std::wstring xCoordString = std::to_wstring(*clickCoordsX);
+        std::wstring yCoordString = std::to_wstring(*clickCoordsY);
+
+        WriteChat(GW::Chat::CHANNEL_GWCA1, xCoordString.c_str(), L"Gwtoolbot");
+        WriteChat(GW::Chat::CHANNEL_GWCA1, yCoordString.c_str(), L"Gwtoolbot");
+    }
+    else {
+        WriteChat(GW::Chat::CHANNEL_GWCA1, L"Coordinates not available.", L"Gwtoolbot");
+    }
+}
 
 void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODULE toolbox_dll)
 {
     ToolboxPlugin::Initialize(ctx, fns, toolbox_dll);
     
     GW::Initialize();
-    FileAccessClock.LastTimeAccesed = clock();
-    //InitSkillData();
+    InitializeSharedMemory(MemData); 
+
+    if (Base_address == 0) { 
+        uintptr_t address = GW::Scanner::Find("\x50\x6A\x0F\x6A\x00\xFF\x35", "xxxxxxx", +7); 
+
+        Base_address = *(uintptr_t*)address; 
+
+        if (Base_address == 0) { 
+            WriteChat(GW::Chat::CHANNEL_GWCA1, L"Failed to find base address.", L"Gwtoolbot");
+        }
+    }
 
     // SERIALIZE SKILL FILE
     wchar_t path[MAX_PATH];
@@ -441,9 +497,6 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
         deserializeSpecialSkills(file_dest_mb);
     }
     
-    
-    
-
 
     StateMachine.State = Idle;
     StateMachine.IsFollowingEnabled = false;
@@ -463,7 +516,7 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
             });
         }); 
      
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autoloot To toggle LootAI", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autoloot To toggle LootAI", L"Hero AI");
 
     GW::Chat::CreateCommand(L"autofollow", [](const wchar_t*, int, const LPWSTR*) {
         GW::GameThread::Enqueue([] {
@@ -477,7 +530,7 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
             }
             });
         });
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autofollow To toggle Follow party Leader", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autofollow To toggle Follow party Leader", L"Hero AI");
 
     GW::Chat::CreateCommand(L"dropitem", [](const wchar_t*, int, const LPWSTR*) {
         GW::GameThread::Enqueue([] {
@@ -492,7 +545,7 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
             }
             });
         });
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /dropitem To drop hovered item to the ground", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /dropitem To drop hovered item to the ground", L"Hero AI");
 
     GW::Chat::CreateCommand(L"autotarget", [](const wchar_t*, int, const LPWSTR*) {
             GW::GameThread::Enqueue([] {
@@ -506,7 +559,7 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
             }
             });
         });
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autotarget To drop hovered item to the ground", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autotarget To drop hovered item to the ground", L"Hero AI");
 
     GW::Chat::CreateCommand(L"scatter", [](const wchar_t*, int, const LPWSTR*) {
         GW::GameThread::Enqueue([] {
@@ -520,7 +573,7 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
             }
             });
         });
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /scatter toggle Scatter AI", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /scatter toggle Scatter AI", L"Hero AI");
 
     GW::Chat::CreateCommand(L"heroai", [](const wchar_t*, int, const LPWSTR*) {
         GW::GameThread::Enqueue([] {
@@ -532,24 +585,24 @@ void HeroAI::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const HMODUL
             StateMachine.IsScatterEnabled = !StateMachine.IsScatterEnabled;
 
 
-for (int i = 0; i < 8; i++) {
-    CombatSkillState[i] = !CombatSkillState[i];
-}
+            for (int i = 0; i < 8; i++) {
+                CombatSkillState[i] = !CombatSkillState[i];
+            }
 
-if (StateMachine.IsFollowingEnabled) {
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"HeroAI Enabled", L"Hero AI");
-}
-else {
-    WriteChat(GW::Chat::CHANNEL_GWCA1, L"HeroAI Disabled", L"Hero AI");
-}
-            });
+            if (StateMachine.IsFollowingEnabled) {
+                WriteChat(GW::Chat::CHANNEL_GWCA1, L"HeroAI Enabled", L"Hero AI");
+            }
+            else {
+                WriteChat(GW::Chat::CHANNEL_GWCA1, L"HeroAI Disabled", L"Hero AI");
+            }
         });
-        WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /heroai to toggle all features at once", L"Hero AI");
+    });
+    WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /heroai to toggle all features at once /helpHAI fore more commands", L"Hero AI");
 
-        GW::Chat::CreateCommand(L"autocombat", &CmdCombat);
+    GW::Chat::CreateCommand(L"autocombat", &CmdCombat);
 
-        WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autocombat add [1-8,all] To add skill to combat queue.", L"Hero AI");
-        WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autocombat remove [1-8,all] To remove skill from combat queue.", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autocombat add [1-8,all] To add skill to combat queue.", L"Hero AI");
+    //WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /autocombat remove [1-8,all] To remove skill from combat queue.", L"Hero AI");
 
 }
 
@@ -604,6 +657,21 @@ bool HeroAI::UpdateGameVars() {
         GameVars.Target.Nearest.Living = GameVars.Target.Nearest.Agent->GetAsAgentLiving();
 
     }
+
+    GameVars.Target.NearestCaster.ID = TargetNearestEnemyInAggro(false, EnemyCaster); 
+    if (GameVars.Target.NearestCaster.ID) {
+        GameVars.Target.NearestCaster.Agent = GW::Agents::GetAgentByID(GameVars.Target.NearestCaster.ID);
+        GameVars.Target.NearestCaster.Living = GameVars.Target.NearestCaster.Agent->GetAsAgentLiving();
+
+    }
+
+    GameVars.Target.NearestMartial.ID = TargetNearestEnemyInAggro(false, EnemyMartial);
+    if (GameVars.Target.NearestMartial.ID) {
+        GameVars.Target.NearestMartial.Agent = GW::Agents::GetAgentByID(GameVars.Target.NearestMartial.ID);
+        GameVars.Target.NearestMartial.Living = GameVars.Target.NearestMartial.Agent->GetAsAgentLiving();
+
+    }
+
     GameVars.CombatField.InAggro = (GameVars.Target.Nearest.ID) ? true : false;
 
     GameVars.Target.Called.ID = GameVars.Party.PartyInfo->players[0].calledTargetId;
@@ -612,10 +680,38 @@ bool HeroAI::UpdateGameVars() {
         GameVars.Target.Called.Living = GameVars.Target.Called.Agent->GetAsAgentLiving();
     }
 
-    GameVars.Target.NearestAlly.ID = TargetLowestAllyInAggro();
-    if (GameVars.Target.NearestAlly.ID) {
-        GameVars.Target.NearestAlly.Agent = GW::Agents::GetAgentByID(GameVars.Target.NearestAlly.ID);
-        GameVars.Target.NearestAlly.Living = GameVars.Target.NearestAlly.Agent->GetAsAgentLiving();
+    GameVars.Target.LowestAlly.ID = TargetLowestAllyInAggro(false,false);
+    if (GameVars.Target.LowestAlly.ID) {
+        GameVars.Target.LowestAlly.Agent = GW::Agents::GetAgentByID(GameVars.Target.LowestAlly.ID);
+        GameVars.Target.LowestAlly.Living = GameVars.Target.LowestAlly.Agent->GetAsAgentLiving();
+
+    }
+
+    GameVars.Target.LowestOtherAlly.ID = TargetLowestAllyInAggro(true,false);
+    if (GameVars.Target.LowestOtherAlly.ID) {
+        GameVars.Target.LowestOtherAlly.Agent = GW::Agents::GetAgentByID(GameVars.Target.LowestOtherAlly.ID);
+        GameVars.Target.LowestOtherAlly.Living = GameVars.Target.LowestOtherAlly.Agent->GetAsAgentLiving();
+
+    }
+
+    GameVars.Target.LowestEnergyOtherAlly.ID = TargetLowestAllyInAggro(true, true);
+    if (GameVars.Target.LowestEnergyOtherAlly.ID) {
+        GameVars.Target.LowestEnergyOtherAlly.Agent = GW::Agents::GetAgentByID(GameVars.Target.LowestEnergyOtherAlly.ID);
+        GameVars.Target.LowestEnergyOtherAlly.Living = GameVars.Target.LowestEnergyOtherAlly.Agent->GetAsAgentLiving();
+
+    }
+
+    GameVars.Target.LowestAllyCaster.ID = TargetLowestAllyInAggro(false, false,AllyCaster);
+    if (GameVars.Target.LowestAllyCaster.ID) {
+        GameVars.Target.LowestAllyCaster.Agent = GW::Agents::GetAgentByID(GameVars.Target.LowestAllyCaster.ID);
+        GameVars.Target.LowestAllyCaster.Living = GameVars.Target.LowestAllyCaster.Agent->GetAsAgentLiving();
+
+    }
+
+    GameVars.Target.LowestAllyMartial.ID = TargetLowestAllyInAggro(false, false, AllyMartial);
+    if (GameVars.Target.LowestAllyMartial.ID) {
+        GameVars.Target.LowestAllyMartial.Agent = GW::Agents::GetAgentByID(GameVars.Target.LowestAllyMartial.ID);
+        GameVars.Target.LowestAllyMartial.Living = GameVars.Target.LowestAllyMartial.Agent->GetAsAgentLiving();
 
     }
 
@@ -672,39 +768,34 @@ bool HeroAI::UpdateGameVars() {
 void HeroAI::Update(float)
 {
     if (!UpdateGameVars()) { return; };
+    
+    MemData->MemPlayers[GameVars.Party.SelfPartyNumber - 1].ID = GameVars.Target.Self.ID;
+    MemData->MemPlayers[GameVars.Party.SelfPartyNumber - 1].Energy = GameVars.Target.Self.Living->energy;
+    MemData->MemPlayers[GameVars.Party.SelfPartyNumber - 1].energyRegen = GameVars.Target.Self.Living->energy_regen;
+    MemData->MemPlayers[GameVars.Party.SelfPartyNumber - 1].IsActive = true;
 
-    if (FileAccessClock.CanAccess()) {
-  
-        const auto res = createMemoryMappedFile(hFileMapping);
-        // Write to the file
-        GameVars.LastTimeSubscribed = clock();
-        if (!writeGameVarsToFile(hFileMapping, GameVars.Party.SelfPartyNumber - 1, &GameVars)) {
-            CloseHandle(hFileMapping);
+    for (int i = 0; i < 8; i++) {
+        if (MemData->MemPlayers[i].IsActive) {
+            MemCopy.MemPlayers[i].ID = MemData->MemPlayers[i].ID;
+            MemCopy.MemPlayers[i].Energy = MemData->MemPlayers[i].Energy;
+            MemCopy.MemPlayers[i].energyRegen = MemData->MemPlayers[i].energyRegen;
+            MemCopy.MemPlayers[i].IsActive = MemData->MemPlayers[i].IsActive;
         }
 
-        // Read from the file
-        
-        for (int i = 0; i < 8; i++) {
-            GameVarsStruct readData; 
-            readGameVarsFromFile(hFileMapping, i, &readData);
-            if (readData.RecentlySubscribed()) {
-                MemPlayers[i] = readData;
-                MemPlayers[i].IsMemoryLoaded = true;
-            }
-            else {
-                MemPlayers[i].IsMemoryLoaded = false;
-            }
-
-        }
-        CloseHandle(hFileMapping);
-        /*if (!readGameVarsFromFile(hFileMapping, GameVars.Party.SelfPartyNumber - 1, &readData)) {
-            CloseHandle(hFileMapping);
-        }*/
-
-
-        FileAccessClock.LastTimeAccesed = clock();
     }
     
+    /*
+    float* clickCoordsX = GetClickCoordsX(); 
+    float* clickCoordsY = GetClickCoordsY(); 
+
+    if (clickCoordsX && clickCoordsY) {
+        float x_coord = *clickCoordsX;
+        float y_coord = *clickCoordsY;
+        //GW::Agents::Move(x_coord,y_coord);
+        SendCoords();
+    }
+    */
+
     /****************** TARGERT MONITOR **********************/
     const auto targetChange = PartyTargetIDChanged();
     if ((StateMachine.IsTargettingEnabled) &&
@@ -882,8 +973,11 @@ GW::AgentID HeroAI::PartyTargetIDChanged() {
     return 0;
 }
 
-uint32_t  HeroAI::TargetNearestEnemyInAggro(bool IsBigAggro) {
+uint32_t  HeroAI::TargetNearestEnemyInAggro(bool IsBigAggro, SkillTarget Target) {
     const auto agents = GW::Agents::GetAgentArray();
+
+    bool IsCaster = false;
+    bool IsMartial = false;
 
     float distance = GW::Constants::Range::Earshot;
     float maxdistance = GW::Constants::Range::Earshot;
@@ -911,6 +1005,23 @@ uint32_t  HeroAI::TargetNearestEnemyInAggro(bool IsBigAggro) {
 
         if (!tempAgent) { continue; }
         if (!tempAgent->GetAsAgentLiving()->GetIsAlive()) { continue; }
+
+        switch (tEnemyLiving->weapon_type) {
+        case wand: 
+        case staff1:
+        case staff2:
+            IsCaster = true;
+            IsMartial = false;
+            break;
+        default:
+            IsCaster = false;
+            IsMartial = true;
+            break;
+        }
+
+        if ((Target == EnemyCaster) && (!IsCaster)) { continue; }
+        if ((Target == EnemyMartial) && (!IsMartial)) { continue; }
+
         const auto dist = GW::GetDistance(GameVars.Target.Self.Living->pos, tempAgent->pos);
 
         if (dist < distance) {
@@ -924,13 +1035,18 @@ uint32_t  HeroAI::TargetNearestEnemyInAggro(bool IsBigAggro) {
     }
 }
 
-uint32_t  HeroAI::TargetLowestAllyInAggro() {
+uint32_t  HeroAI::TargetLowestAllyInAggro(bool OtherAlly,bool CheckEnergy,SkillTarget Target) {
     const auto agents = GW::Agents::GetAgentArray();
 
     float distance = GW::Constants::Range::Spirit;
     static GW::AgentID AllyID;
     static GW::AgentID tStoredAllyID = 0;
+    static GW::AgentID tStoredAllyenergyID = 0;
     float StoredLife = 2.0f;
+    float StoredEnergy = 2.0f;
+
+    bool IsCaster = false;
+    bool IsMartial = false;
 
     for (const GW::Agent* agent : *agents)
     {
@@ -950,17 +1066,42 @@ uint32_t  HeroAI::TargetLowestAllyInAggro() {
         if (!tempAgent->GetAsAgentLiving()->GetIsAlive()) { continue; }
         
         const float vlife = tAllyLiving->hp;
+        const float venergy = tAllyLiving->energy;
 
+        if ((OtherAlly) && (AllyID == GameVars.Target.Self.ID)) { continue; }
 
-        if (vlife < StoredLife) {
+        switch (tAllyLiving->weapon_type) {
+            case wand:
+            case staff1:
+            case staff2:
+                IsCaster = true;
+                IsMartial = false;
+                break;
+            default:
+                IsCaster = false;
+                IsMartial = true;
+                break;
+        }
+
+        if ((Target == AllyCaster) && (!IsCaster)) { continue; }
+        if ((Target == AllyMartial) && (!IsMartial)) { continue; }
+
+        if (vlife < StoredLife)
+        {
             StoredLife = vlife;
             tStoredAllyID = AllyID;
         }
+        if ((venergy < StoredEnergy) && (tAllyLiving->energy_regen < 0.03f))
+        {
+            StoredEnergy = venergy;
+            tStoredAllyenergyID = AllyID;
+        }
     }
-    if (StoredLife != 2.0f) { return tStoredAllyID; }
-    else {
-        return 0;
-    }
+    if ((!CheckEnergy) && (StoredLife != 2.0f)) { return tStoredAllyID; }
+    if ((CheckEnergy) && (StoredEnergy != 2.0f)) { return tStoredAllyenergyID; }
+
+    return 0;
+
 }
 
 uint32_t  HeroAI::TargetDeadAllyInAggro() {
@@ -1044,38 +1185,64 @@ bool HeroAI::IsSkillready(uint32_t slot) {
 GW::AgentID HeroAI::GetAppropiateTarget(uint32_t slot) {
     GW::AgentID vTarget = 0;
     /* --------- TARGET SELECTING PER SKILL --------------*/
-    if (GameVars.SkillBar.Skills[slot].HasCustomData) {
-        switch (GameVars.SkillBar.Skills[slot].CustomData.TargetAllegiance) {
-        case Enemy:
-        case EnemyCaster:
-        case EnemyMartial:
-            vTarget = GameVars.Target.Called.ID;
-            if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
-            break;
-        case Ally:
-        case AllyCaster:
-        case AllyMartial:
-        case OtherAlly:
-            vTarget = GameVars.Target.NearestAlly.ID;
-            break;
-        case Self:
-            vTarget = GameVars.Target.Self.ID;
-            break;
-        case DeadAlly:
-            vTarget = GameVars.Target.DeadAlly.ID;
-            break;
-        default:
-            vTarget = GameVars.Target.Called.ID;
-            if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
-            break;
-            //  enum SkillTarget { Enemy, EnemyCaster, EnemyMartial, Ally, AllyCaster, AllyMartial, OtherAlly,DeadAlly, Self, Corpse, Minion, Spirit, Pet };
+    if (StateMachine.IsTargettingEnabled) {
+        if (GameVars.SkillBar.Skills[slot].HasCustomData) {
+            switch (GameVars.SkillBar.Skills[slot].CustomData.TargetAllegiance) {
+            case Enemy:
+                vTarget = GameVars.Target.Called.ID;
+                if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
+                break;
+            case EnemyCaster:
+                vTarget = GameVars.Target.NearestCaster.ID;
+                if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
+                break;
+            case EnemyMartial:
+                vTarget = GameVars.Target.NearestMartial.ID;
+                if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
+                break;
+            case Ally:
+                vTarget = GameVars.Target.LowestAlly.ID;
+                break;
+            case AllyCaster:
+                vTarget = GameVars.Target.LowestAllyCaster.ID;
+                if (!vTarget) { vTarget = GameVars.Target.LowestAlly.ID; }
+                break;
+            case AllyMartial:
+                vTarget = GameVars.Target.LowestAllyMartial.ID;
+                if (!vTarget) { vTarget = GameVars.Target.LowestAlly.ID; }
+                break;
+            case OtherAlly:
+                if ((GameVars.SkillBar.Skills[slot].HasCustomData) &&
+                    (GameVars.SkillBar.Skills[slot].CustomData.Nature == EnergyBuff)) {
+                    vTarget = GameVars.Target.LowestEnergyOtherAlly.ID;
+                }
+                else { vTarget = GameVars.Target.LowestOtherAlly.ID; }
+
+                if (!vTarget) { vTarget = GameVars.Target.LowestAlly.ID; }
+                break;
+            case Self:
+                vTarget = GameVars.Target.Self.ID;
+                break;
+            case DeadAlly:
+                vTarget = GameVars.Target.DeadAlly.ID;
+                break;
+            default:
+                vTarget = GameVars.Target.Called.ID;
+                if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
+                break;
+                //  enum SkillTarget { Enemy, EnemyCaster, EnemyMartial, Ally, AllyCaster, AllyMartial, OtherAlly,DeadAlly, Self, Corpse, Minion, Spirit, Pet };
+            }
         }
+        else {
+            vTarget = GameVars.Target.Called.ID;
+            if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
+        }
+        return vTarget;
     }
-    else {
-        vTarget = GameVars.Target.Called.ID;
-        if (!vTarget) { vTarget = GameVars.Target.Nearest.ID; }
+    else
+    {
+        return GW::Agents::GetTargetId();
     }
-    return vTarget;
 }
 
 bool HeroAI::IsReadyToCast(uint32_t slot) {
@@ -1193,7 +1360,9 @@ bool HeroAI::CanTerminate()
 
 void HeroAI::Terminate()
 {
-    CloseHandle(hFileMapping);
+    MemData->MemPlayers[GameVars.Party.SelfPartyNumber - 1].IsActive = false;
+    UnmapViewOfFile(MemData);
+    CloseHandle(hMapFile);
     ToolboxPlugin::Terminate();
     GW::Terminate();
 }
@@ -1367,7 +1536,7 @@ bool HeroAI::HasEffect(const GW::Constants::SkillID skillID, GW::AgentID agentID
 
 int HeroAI::GetMemPosByID(GW::AgentID agentID) {
     for (int i = 0; i < 8; i++) {
-        if ((MemPlayers[i].RecentlySubscribed()) && (MemPlayers[i].Target.Self.ID == agentID)) {
+        if ((MemCopy.MemPlayers[i].IsActive) && (MemCopy.MemPlayers[i].ID == agentID)) {
             return i;
         }   
     }
@@ -1419,7 +1588,7 @@ bool HeroAI::AreCastConditionsMet(uint32_t slot, GW::AgentID agentID) {
             else { return false; }
             break;
         default:
-            return false;
+            return true;
         } 
     }
 
@@ -1461,10 +1630,11 @@ bool HeroAI::AreCastConditionsMet(uint32_t slot, GW::AgentID agentID) {
     
     
     //ENERGY CHECKS
-    if ((MemPlayers[GetMemPosByID(agentID)].RecentlySubscribed()) &&
+    int PIndex = GetMemPosByID(agentID);
+    if ((MemCopy.MemPlayers[PIndex].IsActive) &&
         (GameVars.SkillBar.Skills[slot].CustomData.Conditions.LessEnergy != 0.0f) &&
-        (MemPlayers[GetMemPosByID(agentID)].Target.Self.Living->energy < GameVars.SkillBar.Skills[slot].CustomData.Conditions.LessEnergy) &&
-        (MemPlayers[GetMemPosByID(agentID)].Target.Self.Living->energy_regen < 0.03f)) {
+        (MemCopy.MemPlayers[PIndex].Energy < GameVars.SkillBar.Skills[slot].CustomData.Conditions.LessEnergy) &&
+        (MemCopy.MemPlayers[PIndex].energyRegen < 0.03f)) {
         NoOfFeatures++; 
     }
     
@@ -1487,6 +1657,11 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Buff;
     SpecialSkills[ptr].Conditions.IsNockedDown = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::I_Will_Avenge_You;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
+    SpecialSkills[ptr].TargetAllegiance = DeadAlly;
+    SpecialSkills[ptr].Nature = Buff;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::I_Will_Survive;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
     SpecialSkills[ptr].TargetAllegiance = Self;
@@ -1499,11 +1674,35 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.LessLife = 0.5F;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Body_Blow; 
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack; 
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Bulls_Charge;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Bulls_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Counterattack;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.IsAttacking = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Defy_Pain;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.LessLife = 0.5f;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Disarm;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack; 
@@ -1511,11 +1710,29 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Interrupt; 
     SpecialSkills[ptr].Conditions.IsCasting = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Dwarven_Battle_Stance;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Endure_Pain;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.LessLife = 0.5f;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Lions_Comfort;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
     SpecialSkills[ptr].TargetAllegiance = Self;
     SpecialSkills[ptr].Nature = Healing;
-    SpecialSkills[ptr].Conditions.LessLife = 0.9F;
+    SpecialSkills[ptr].Conditions.LessLife = 0.75F;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Magehunter_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasEnchantment = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Protectors_Strike;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
@@ -1523,12 +1740,55 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.IsMoving = true;
     ptr++;   
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shield_Bash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Signet_of_Stamina;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Signet;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.LessLife = 0.5f;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Warriors_Endurance;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
     //AXE MASTERY
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Agonizing_Chop;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Interrupt;
+    SpecialSkills[ptr].Conditions.HasDeepWound = true;
+    SpecialSkills[ptr].Conditions.IsCasting = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Axe_Rake;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasDeepWound = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Axe_Twist;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasDeepWound = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Disrupting_Chop;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Interrupt;
     SpecialSkills[ptr].Conditions.IsCasting = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Lacerating_Chop;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
     ptr++;
     //HAMMER MASTERY
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Belly_Smash;
@@ -1543,18 +1803,72 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Offensive; 
     SpecialSkills[ptr].Conditions.IsAttacking = true; 
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Crushing_Blow;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Enraged_Smash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Magehunters_Smash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasEnchantment = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Overbearing_Smash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Pulverizing_Smash;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.IsNockedDown = true;
     ptr++;
-    //SWORDMANSHIP
-    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Knee_Cutter;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Renewing_Smash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Yeti_Smash;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
+    //SWORDMANSHIP
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Final_Thrust;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.LessLife = 0.5f;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Gash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasBleeding = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Knee_Cutter;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasCrippled = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Quivering_Blade;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Savage_Slash;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
@@ -1562,13 +1876,80 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Interrupt;
     SpecialSkills[ptr].Conditions.IsCasting = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Steelfang_Slash;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
     //TACTICS
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::None_Shall_Pass;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Retreat;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
+    SpecialSkills[ptr].TargetAllegiance = DeadAlly;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.IsAlive = false;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Victory_Is_Mine;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Deadly_Riposte;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Healing_Signet;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Signet;
     SpecialSkills[ptr].TargetAllegiance = Self;
     SpecialSkills[ptr].Nature = Healing;
-    SpecialSkills[ptr].Conditions.LessLife = 0.9F;
+    SpecialSkills[ptr].Conditions.LessLife = 0.75F;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Riposte;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shield_Stance;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shove;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Soldiers_Defense;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Soldiers_Speed;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Soldiers_Stance;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    
     //NO ATTRIBUTE
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Coward;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
@@ -1577,6 +1958,12 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Conditions.IsMoving = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::On_Your_Knees;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Youre_All_Alone;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Offensive;
@@ -1602,6 +1989,7 @@ void HeroAI::InitSkillData() {
     ptr++;
     //RANGER
     //EXPERTISE
+    
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Distracting_Shot; 
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack; 
     SpecialSkills[ptr].TargetAllegiance = Enemy; 
@@ -1609,11 +1997,35 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Conditions.IsCasting = true;
     ptr++;
     //BEAST MASTERY
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Bestial_Mauling;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Bestial_Pounce;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsCasting = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Brutal_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.LessLife = 0.5f;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Comfort_Animal;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
     SpecialSkills[ptr].TargetAllegiance = Pet;
     SpecialSkills[ptr].Nature = Healing;
-    SpecialSkills[ptr].Conditions.LessLife = 0.9F;
+    SpecialSkills[ptr].Conditions.LessLife = 0.75f;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Companionship;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Healing;
+    SpecialSkills[ptr].Conditions.LessLife = 0.75f;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Disrupting_Lunge;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
@@ -1626,6 +2038,47 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Pet;
     SpecialSkills[ptr].Nature = Healing;
     SpecialSkills[ptr].Conditions.LessLife = 0.9F;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Maiming_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Pounce;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Rampage_as_One;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Pet;
+    SpecialSkills[ptr].Nature = Buff;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Revive_Animal;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Pet;
+    SpecialSkills[ptr].Nature = Resurrection;
+    SpecialSkills[ptr].Conditions.IsAlive = false;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Savage_Pounce;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Interrupt;
+    SpecialSkills[ptr].Conditions.IsCasting = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Scavenger_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::PetAttack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Symbiotic_Bond;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Shout;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Interrupt;
+    SpecialSkills[ptr].Conditions.IsCasting = true;
     ptr++;
     //MARKSMANSHIP
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Broad_Head_Arrow;
@@ -1646,6 +2099,12 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Interrupt;
     SpecialSkills[ptr].Conditions.IsCasting = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Melandrus_Shot;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsMoving = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Punishing_Shot;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
@@ -1659,13 +2118,31 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Conditions.IsCasting = true;
     ptr++;
     //WILDERNESS SURVIVAL
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Melandrus_Resilience;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Stance;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Healing;
+    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Scavengers_Focus;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Troll_Unguent;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Healing;
+    SpecialSkills[ptr].Conditions.LessLife = 0.75f;
+    ptr++;
     //NO ATTRIBUTE
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Antidote_Signet;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Signet;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
+    SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Magebane_Shot;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Attack;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
@@ -1674,6 +2151,7 @@ void HeroAI::InitSkillData() {
     ptr++;
     //MONK
     //DIVINE FAVOR
+       
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Blessed_Aura;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Self;
@@ -1700,7 +2178,7 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Deny_Hexes;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Hex_Removal;
     SpecialSkills[ptr].Conditions.HasHex = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Divine_Boon;
@@ -1795,11 +2273,6 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Healing;
     SpecialSkills[ptr].Conditions.LessLife = 0.9F;
-    ptr++;
-    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Watchful_Healing;
-    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
-    SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Withdraw_Hexes;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
@@ -2041,6 +2514,11 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = OtherAlly;
     SpecialSkills[ptr].Nature =Enchantment_Removal;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Amity;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Aura_of_Faith;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Ally;
@@ -2054,26 +2532,33 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Convert_Hexes;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = OtherAlly;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Hex_Removal;
     SpecialSkills[ptr].Conditions.HasHex = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Dismiss_Condition;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Divert_Hexes;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Hex_Removal;
     SpecialSkills[ptr].Conditions.HasHex = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Draw_Conditions;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = OtherAlly;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Extinguish;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Ally;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
+    SpecialSkills[ptr].Conditions.HasCondition = true;
+    SpecialSkills[ptr].Conditions.IsPartyWide = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Guardian;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2105,25 +2590,30 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Buff;
-    SpecialSkills[ptr].Conditions.LessLife = 0.9F;
+    SpecialSkills[ptr].Conditions.LessLife = 0.5F;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Mend_Ailment;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Mend_Condition;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Mending_Touch;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Pacifism;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Pensive_Guardian;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2155,7 +2645,7 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Restore_Condition;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = OtherAlly;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Reversal_of_Fortune;
@@ -2167,8 +2657,14 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Reverse_Hex;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Hex_Removal;
     SpecialSkills[ptr].Conditions.HasHex = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shield_Guardian;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
+    SpecialSkills[ptr].TargetAllegiance = Ally;
+    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Conditions.LessLife = 0.75F;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shield_of_Absorption;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2226,6 +2722,29 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Buff;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Bane_Signet;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Signet;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsAttacking = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Castigation_Signet;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Signet;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsAttacking = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Defenders_Zeal;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Holy_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Holy_Wrath;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = OtherAlly;
@@ -2241,6 +2760,11 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Offensive;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Kirins_Wrath;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Retribution;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Ally;
@@ -2251,27 +2775,65 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Buff;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Scourge_Enchantment;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Scourge_Healing;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Scourge_Sacrifice;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shield_of_Judgment;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Offensive;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Smite;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsAttacking = true;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Smite_Condition;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Smite_Hex;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Hex_Removal;
     SpecialSkills[ptr].Conditions.HasHex = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Spear_of_Light;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsAttacking = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Stonesoul_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Skill;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsNockedDown = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Strength_of_Honor;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Ally;
     SpecialSkills[ptr].Nature = Buff;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Symbol_of_Wrath;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Self;
+    SpecialSkills[ptr].Nature = Offensive;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Zealots_Fire;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2281,11 +2843,10 @@ void HeroAI::InitSkillData() {
     //NO ATTRIBUTE
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Empathic_Removal;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
-    SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].TargetAllegiance = OtherAlly;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     SpecialSkills[ptr].Conditions.HasHex = true;
-    SpecialSkills[ptr].Conditions.UniqueProperty = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Essence_Bond;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2306,13 +2867,13 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Purge_Conditions;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Self;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Remove_Hex;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Hex_Removal;
     SpecialSkills[ptr].Conditions.HasHex = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Resurrect;
@@ -2343,11 +2904,17 @@ void HeroAI::InitSkillData() {
     ptr++;
     //NECROMANCER
     //SOUL REAPING
+
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Foul_Feast;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Ally;
-    SpecialSkills[ptr].Nature = Buff;
+    SpecialSkills[ptr].Nature = Condi_Cleanse;
     SpecialSkills[ptr].Conditions.HasCondition = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Icy_Veins;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Hexers_Vigor;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2359,6 +2926,11 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Self;
     SpecialSkills[ptr].Nature = Buff;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Reapers_Mark;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Signet_of_Lost_Souls;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Signet;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
@@ -2369,6 +2941,11 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
     SpecialSkills[ptr].TargetAllegiance = Self;
     SpecialSkills[ptr].Nature = Buff;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Wail_of_Doom;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
     ptr++;
     //BLOOD MAGIC
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Awaken_the_Blood;
@@ -2393,6 +2970,12 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = OtherAlly;
     SpecialSkills[ptr].Nature = EnergyBuff;
     SpecialSkills[ptr].Conditions.LessEnergy = 0.3f;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Blood_of_the_Aggressor;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.IsAttacking = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Contagion;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2431,11 +3014,22 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Enchantment_Removal;
     SpecialSkills[ptr].Conditions.HasEnchantment = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Lifebane_Strike;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.MoreLife = 0.5f;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Mark_of_Subversion;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
     SpecialSkills[ptr].TargetAllegiance = EnemyCaster;
     SpecialSkills[ptr].Nature = Offensive;
-    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Oppressive_Gaze;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasCondition = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Order_of_Pain;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Enchantment;
@@ -2475,12 +3069,28 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
     SpecialSkills[ptr].TargetAllegiance = EnemyCaster;
     SpecialSkills[ptr].Nature = Offensive;
-    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Depravity;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyCaster;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Desecrate_Enchantments;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
+    SpecialSkills[ptr].TargetAllegiance = Enemy;
+    SpecialSkills[ptr].Nature = Offensive;
+    SpecialSkills[ptr].Conditions.HasEnchantment = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Envenom_Enchantments;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Enchantment_Removal;
+    SpecialSkills[ptr].Conditions.HasEnchantment = true;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Meekness;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyMartial;
+    SpecialSkills[ptr].Nature = Offensive;
     SpecialSkills[ptr].Conditions.HasEnchantment = true;
     ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Order_of_Apostasy;
@@ -2508,6 +3118,16 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Conditions.HasCondition = true;
     SpecialSkills[ptr].Conditions.UniqueProperty = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Price_of_Failure;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyMartial;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Reckless_Haste;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyMartial;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Plague_Touch;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
     SpecialSkills[ptr].TargetAllegiance = Enemy;
@@ -2527,6 +3147,22 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].Nature = Enchantment_Removal;
     SpecialSkills[ptr].Conditions.HasEnchantment = true;
     ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shadow_of_Fear;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyMartial;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Shivers_of_Dread;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyCaster;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+    SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Spinal_Shivers;
+    SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Hex;
+    SpecialSkills[ptr].TargetAllegiance = EnemyCaster;
+    SpecialSkills[ptr].Nature = Offensive;
+    ptr++;
+
     //DEATH MAGIC
     SpecialSkills[ptr].SkillID = GW::Constants::SkillID::Animate_Bone_Fiend;
     SpecialSkills[ptr].SkillType = GW::Constants::SkillType::Spell;
@@ -2671,7 +3307,7 @@ void HeroAI::InitSkillData() {
     SpecialSkills[ptr].TargetAllegiance = Enemy;
     SpecialSkills[ptr].Nature = Enchantment_Removal;
     SpecialSkills[ptr].Conditions.HasEnchantment = true;
-    SpecialSkills[ptr].Conditions.UniqueProperty = true;
+    SpecialSkills[ptr].Conditions.MoreLife = 0.5f;
     ptr++;
     //MESMER
     //FAST CASTING
