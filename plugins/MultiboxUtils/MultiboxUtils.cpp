@@ -7,7 +7,7 @@
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/Managers/AgentMgr.h>
 #include <GWCA/Managers/ChatMgr.h>
-#include <GWCA/Managers/CtoSMgr.h>
+//#include <GWCA/Managers/CtoSMgr.h>
 #include <GWCA/Managers/GameThreadMgr.h>
 #include <GWCA/GameEntities/Party.h>
 #include <GWCA/Managers/PartyMgr.h>
@@ -20,8 +20,8 @@
 #define GAME_CMSG_INTERACT_GADGET                   (0x004F) // 79
 #define GAME_CMSG_SEND_SIGNPOST_DIALOG              (0x0051) // 81
 
-bool IsFollowing = false;
-bool IsLooting = false;
+bool IsFollowing = true;
+bool IsLooting = true;
 bool LootingRoutineStarted = false;
 static auto Last_Activity = clock();
 
@@ -38,7 +38,7 @@ void MultiboxUtils::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const
 
     GW::Initialize();
     
-    GW::Chat::CreateCommand(L"follow", [](const wchar_t*, int, const LPWSTR*) {
+    /*GW::Chat::CreateCommand(L"follow", [](const wchar_t*, int, const LPWSTR*) {
         GW::GameThread::Enqueue([] {
             IsFollowing = !IsFollowing;
             if (IsFollowing) {
@@ -63,6 +63,7 @@ void MultiboxUtils::Initialize(ImGuiContext* ctx, const ImGuiAllocFns fns, const
             });
         });
     WriteChat(GW::Chat::CHANNEL_GWCA1, L"Use /loot to toggle Auto-Loot", L"MultiboxUtils");
+    */
 }
 
 void MultiboxUtils::Update(float)
@@ -144,7 +145,9 @@ void MultiboxUtils::TargetNearestItem()
                             //GW::Agents::ChangeTarget(ItemID);
                             //auto tTarget = GW::Agents::GetTarget();
                             //GW::Agents::PickUpItem(tTarget, false);
-                            GW::Agents::PickUpItem(GW::Agents::GetAgentByID(ItemID), false);
+                            // GW::Agents::PickUpItem(ItemID, false);
+                            //GW::Items::PickupItem(GW::Agents::GetAgentByID(ItemID), false);
+                            GW::Agents::InteractAgent(GW::Agents::GetAgentByID(ItemID), false);
                         }
                     }
                 }
