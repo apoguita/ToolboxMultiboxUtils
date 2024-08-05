@@ -14,6 +14,8 @@ MapIntersect_pt MapIntersect_Func = 0;
 uintptr_t ptrBase_address = 0;
 uintptr_t ptrNdcScreenCoords = 0;
 
+uintptr_t ptrPathing_func = 0;
+
 class MemMgrClass {
 private:
     
@@ -123,10 +125,13 @@ void MemMgrClass::InitializeSharedMemory(MemPlayerStruct*& pData) {
             pData->MemPlayers[i].FlagPos.y = 0.0f;
 
             pData->GameState[i].state.Following = true;
-            pData->GameState[i].state.Scatter = true;
+            pData->GameState[i].state.Collision = true;
             pData->GameState[i].state.Looting = true;
             pData->GameState[i].state.Combat = true;
             pData->GameState[i].state.Targetting = true;
+            pData->GameState[i].state.RangedRangeValue = GW::Constants::Range::Spellcast;
+            pData->GameState[i].state.MeleeRangeValue = GW::Constants::Range::Spellcast;
+            pData->GameState[i].state.CollisionBubble = 80.0f;
 
             for (int j = 0; j < 8; j++) {
                 pData->GameState[i].CombatSkillState[j] = true;

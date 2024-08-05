@@ -35,6 +35,23 @@ struct GlobalMouseClass {
     };
 };
 
+struct NamedValue {
+    float value;
+    const char* name;
+};
+
+std::vector<NamedValue> namedValues = {
+    { 322.0f, "Area" },
+    { 322.0f + 322.0f, "Area x 2" },
+    { 1012.0f, "Earshot" },
+    { 1248.0f, "Spellcast" },
+    { 1248.0f + 322.0f , "Spellcast + Area" },
+    { 2500.0f , "Spirit" },
+    { 2500.0f + 1248.0f, "Spirit + Spellcast" },
+    { 5000.0f , "Compass" },
+
+};
+
 class OverlayClass {
 private:
     XMMATRIX CreateViewMatrix(const XMFLOAT3& eye_pos, const XMFLOAT3& look_at_pos, const XMFLOAT3& up_direction);
@@ -43,6 +60,13 @@ private:
     void GetScreenToWorld();
     float findZ(float x, float y, float pz);
 public:
+        int MeleeAutonomy = 3;
+        int RangedAutonomy = 3;
+
+        ImVec2 mainWindowPos;
+        ImVec2 mainWindowSize;
+
+    
         GW::Vec3f WorldToScreen(const GW::Vec3f& world_position);
         GW::Vec3f ScreenToWorld();
         void BeginDraw();
@@ -61,6 +85,13 @@ public:
 
         void DrawFlagAll(ImDrawList* drawList, GW::Vec3f pos);
         void DrawFlagHero(ImDrawList* drawList, GW::Vec3f origin);
+
+        bool ToggleButton(const char* str_id, bool* v, int width, int height, bool enabled);
+        bool SelectableComboValues(const char* label, int* currentIndex, std::vector<NamedValue>& values);
+        void DrawYesNoText(const char* label, bool condition);
+        void DrawEnergyValue(const char* label, float energy, float threshold);
+        void ShowTooltip(const char* tooltipText);
+        void DrawMainWin();
 
         void DrawDoubleRowLineFormation(ImDrawList* drawList, const GW::Vec3f& center, float angle, ImU32 color);
 };
@@ -160,7 +191,7 @@ void OverlayClass::GetScreenToWorld() {
 
     GW::GameThread::Enqueue([]() {
 
-        MemMgrClass ptrGetter;
+        MemMgrClass ptrGetter; 
         GlobalMouseClass setmousepos;
         GW::Vec2f* screen_coord = 0;
         uintptr_t address = GW::Scanner::Find("\x8B\xE5\x5D\xC3\x8B\x4F\x10\x83\xC7\x08", "xxxxxxxxxx", 0xC);
@@ -452,3 +483,99 @@ void OverlayClass::DrawDoubleRowLineFormation(ImDrawList* drawList, const GW::Ve
     
 }
 
+bool OverlayClass::ToggleButton(const char* str_id, bool* v, int width, int height, bool enabled)
+{
+    bool clicked = false;
+
+    if (enabled)
+    {
+        if (*v)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.153f, 0.318f, 0.929f, 1.0f)); // Customize color when off 
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.6f, 0.6f, 0.9f, 1.0f)); // Customize hover color 
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.6f, 0.6f, 1.0f)); // Customize active color 
+            clicked = ImGui::Button(str_id, ImVec2(width, height)); // Customize size if needed 
+            ImGui::PopStyleColor(3);
+        }
+        else { clicked = ImGui::Button(str_id, ImVec2(width, height)); }
+    }
+    else
+    {
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.9f, 0.9f, 0.3f)); // Customize active color 
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.9f, 0.9f, 0.3f)); // Customize hover color 
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.9f, 0.9f, 0.3f)); // Custom disabled color
+        ImGui::Button(str_id, ImVec2(width, height)); // Custom size if needed
+        ImGui::PopStyleColor(3);
+    }
+
+    if (clicked) { *v = !(*v); }
+
+    return clicked;
+}
+
+
+
+bool OverlayClass::SelectableComboValues(const char* label, int* currentIndex, std::vector<NamedValue>& values)
+{
+    bool changed = false;
+
+    std::vector<std::string> items;
+    for (const auto& value : values)
+    {
+        std::stringstream ss;
+        ss << value.name << " (" << std::fixed << std::setprecision(2) << value.value << ")";
+        items.push_back(ss.str());
+    }
+
+    std::vector<const char*> items_cstr;
+    for (const auto& item : items)
+    { items_cstr.push_back(item.c_str()); }
+
+    // Display label and Combo box
+    ImGui::Text("%s", label);
+    ImGui::SameLine();
+    if (ImGui::Combo((std::string("##") + label).c_str(), currentIndex, items_cstr.data(), static_cast<int>(items_cstr.size())))
+    { changed = true; }
+
+    return changed;
+}
+
+void  OverlayClass::DrawYesNoText(const char* label, bool condition) {
+    if (condition) {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 255, 0, 255)); // Green color
+        ImGui::Text("%s: Yes", label);
+        ImGui::PopStyleColor();
+    }
+    else {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255)); // Red color
+        ImGui::Text("%s: No", label);
+        ImGui::PopStyleColor();
+    }
+}
+
+void OverlayClass::DrawEnergyValue(const char* label, float energy, float threshold) {
+    if (energy < threshold) {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255)); // Red color
+        ImGui::Text("%s: %.2f", label, energy);
+        ImGui::PopStyleColor();
+    }
+    else {
+        ImGui::Text("%s: %.2f", label, energy);
+    }
+}
+
+void OverlayClass::ShowTooltip(const char* tooltipText)
+{
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::BeginTooltip();
+        ImGui::Text("%s", tooltipText);
+        ImGui::EndTooltip();
+    }
+}
+
+void OverlayClass::DrawMainWin()
+{
+
+
+}

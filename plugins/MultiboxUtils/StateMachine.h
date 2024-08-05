@@ -24,6 +24,9 @@ struct ExperimentalFlagsClass {
     bool TakeQuest;
     bool Openchest;
     bool ForceFollow;
+    bool Pathing;
+    bool Collisions;
+    bool TargettingDebug;
     bool FormationA;
     bool FormationB;
     bool FormationC;
@@ -42,23 +45,24 @@ private:
         bool Looting = true;
         bool Combat = true;
         bool Targetting = true;
-        bool Scatter = true;
+        bool Collision = true;
         bool HeroFlag = false;
         bool isFollowingEnabled() const { return Following; }
         bool isLootingEnabled() const { return Looting; }
         bool isCombatEnabled() const { return Combat; }
         bool isTargettingEnabled() const { return Targetting; }
-        bool isScatterEnabled() const { return Scatter; }
+        bool isCollisionEnabled() const { return Collision; }
         bool isHeroFlagEnabled() const { return HeroFlag; }
 
         void toggleFollowing() { Following = !Following; }
         void toggleLooting() { Looting = !Looting; }
         void toggleCombat() { Combat = !Combat; }
         void toggleTargetting() { Targetting = !Targetting; }
-        void toggleScatter() { Scatter = !Scatter; }
+        void toggleCollision() { Collision = !Collision; }
         void toggleHeroFlag() { HeroFlag = !HeroFlag; }
         float RangedRangeValue = GW::Constants::Range::Area;
         float MeleeRangeValue = GW::Constants::Range::Spellcast;
+        float CollisionBubble = GW::Constants::Range::Touch/2;
      
     };
 
